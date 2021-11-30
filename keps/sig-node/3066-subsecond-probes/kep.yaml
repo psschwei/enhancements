@@ -1,0 +1,32 @@
+title: Subsecond Probes
+kep-number: 3066
+authors:
+  - "@mikebrow"
+  - "@psschwei"
+  - "@MHBauer"
+owning-sig: sig-node
+participating-sigs:
+  - sig-node
+status: implementable
+creation-date: 2021-11-30
+reviewers:
+  - "@mrunalp"
+  - "@adisky"
+approvers:
+  - "@dchen1107"
+  - "@derekwaynecarr"
+prr-approvers:
+  - "@johnbelarmic"
+stage: alpha
+latest-milestone: "v1.25"
+milestone:
+  alpha: "v1.25"
+  beta: "v1.26"
+  stable: "v1.28"
+feature-gates:
+  - name: ProbeReadSecondsAs
+    components:
+      - kubelet
+      - tbd
+disable-supported: tbd
+metrics:
