@@ -161,10 +161,6 @@ demonstrate the interest in a KEP within the wider Kubernetes community.
 [experience reports]: https://github.com/golang/go/wiki/ExperienceReports
 -->
 
-#### Istio
-
-TODO(???): explain this scenario, presumably around sidecar readiness?
-
 #### Knative
 
 Knative will create Pods (via Deployment) and wait for them to become `Ready`
@@ -182,7 +178,6 @@ know that this has succeeded?
 An ability to specify timeouts that are less than one second.
 Add additional tests cases to the timeout test cases.
 
-? link to existing test cases ?
 
 ### Non-Goals
 
@@ -192,41 +187,43 @@ and make progress.
 -->
 
 V2 API for existing objects.
-Converting fields from int32 to resource.Quantity.
+Converting fields from `int32` to `resource.Quantity`.
 
 
 ## Proposal
 
-Add a new struct, `ProbeOffset`, with two subfields: `unit` (type string) and value (type uint32). 
+Add three new fields (of type `int32`) to the Probe struct, which would be used to handle time values in milliseconds: 
 
-That struct would be used to create three new fields in a Probe: 
-- `periodSecondsOffset`
-- `initialDelaySecondsOffset`
-- `timeoutSecondsOffset`
+- `periodSecondsMilliseconds`
+- `initialDelaySecondsMilliseconds`
+- `timeoutSecondsMilliseconds`
 
-The offset would be used to adjust the timing intervals within probes, by adding the offset value to the probe value. For example,
+The seconds and milliseconds fields would be summed to get the appropriate duration. For example,
 
-    ```yaml
-    ...
-    periodSeconds: 1
-    periodSecondsOffset:
-        - unit: Milliseconds
-          value: 500
-    ```
+```
+...
+periodSeconds: 1
+periodMilliseconds: 500
+...
+```
 
-would translate to a `periodSecond` value of `500ms`. 
+would be considered a period value of 1.5s or 1500ms. These values are used as `time.Duration` within the prober package ([ex1](https://github.com/kubernetes/kubernetes/blob/a750d8054a6cb3167f495829ce3e77ab0ccca48e/pkg/kubelet/prober/prober.go#L161) [ex2](https://github.com/kubernetes/kubernetes/blob/a750d8054a6cb3167f495829ce3e77ab0ccca48e/pkg/kubelet/prober/worker.go#L132) ), so there's no real difference between 1.5s and 1500ms.
 
 A few additional examples:
 
-`periodSeconds: 2` and `offset: 500ms` would be `1.5s`
+`periodSeconds: 2` and `periodMilliseconds: -500` would be 0.5s / 500ms.
 
-`periodSeconds: 1` and `offset: 900ms` would be `0.1s`
+`periodSeconds: 1` and `periodMilliseconds: -900` would be 0.1s / 100ms.
 
-`periodSeconds: 1` and `offset: 100ms` would be `0.9s`
+More generally, the effective periodSeconds value would be = `periodSeconds` + `periodMilliseconds`.
 
-More generally, the effective periodSeconds value would be = `periodSeconds` - `periodSecondsOffset`.
+There are a few corner cases around default values:
 
-Each offset would be restricted to a value less than `1s`, and the offset would never allow the adjusted interval to be less than 0 (if it was less than 0, it would get failed at the validation stage).
+`periodSeconds: 0` and `perMilliseconds: 500` would be 10.5s / 10500ms (as 0 => 10 for `periodSeconds` via [defaults.go](https://github.com/kubernetes/kubernetes/blob/3b13e9445a3bf86c94781c898f224e6690399178/pkg/apis/core/v1/defaults.go#L213-L215))
+
+`timeoutSeconds: 0` and `timeoutMilliseconds: 500` would be 1.5s / 1500ms (as 0 => 1 for `timeoutSeconds` via [defaults.go](https://github.com/kubernetes/kubernetes/blob/3b13e9445a3bf86c94781c898f224e6690399178/pkg/apis/core/v1/defaults.go#L210-L212))
+
+Each millisecond field would be restricted to a value less than `1000` (i.e. less than 1 second), and the adjusted interval would never be allowed to be less than 0 (if it was less than 0, it would get failed at the validation stage).
 
 
 ### User Stories (Optional)
@@ -239,6 +236,10 @@ bogged down.
 -->
 
 #### Knative
+
+See the discussion from the Sept 14, 2021 SIG-Node meeting
+[recording](https://youtu.be/LMh7c9e7H-Q?list=PL69nYSiGNLP1wJPj5DYWXjiArF-MJ5fNG&t=1049)
+[meeting notes](https://docs.google.com/document/d/1Ne57gvidMEWXR70OxxnRkYquAoMpt56o75oZtg-OeBg/edit#heading=h.by9uk7onna00)
 
 ### Notes/Constraints/Caveats (Optional)
 
@@ -265,15 +266,15 @@ Consider including folks who also work outside the SIG or subproject.
 
 Changing defaults is a strict no-go.
 
-
-
 Accidentally setting a timeout too low could DOS kubelet if many are used.
 Mitigate by preventing timeout values too small.
 Could be configurable,
-100milliseconds is a first guess.
+100ms is a first guess, but could be adjusted based on user feedback during alpha and performance testing. Could also implement a scaling repeat to reduce risk of thrashing.
 
-UX reviewed by existing users of Probe struct.
-? add details on who that is?
+Benchmarking currently WIP for alpha, will be implemented for beta to determine the ideal floor. Several benchmarking tools are being considered (options include ones developed by Knative, Amazon, Red Hat). Benchmarking tooling will also work for similar areas (such as the PLEG work.)
+
+Question raised of how probes should be charged: charging is an issue for all exec/attach/port forward requests, and as usual the process in the container should be charged to the container/pod. This KEP isn't looking to make any major architectural changes in this regard.
+
 
 #### Overriding an existing field
 
@@ -281,12 +282,43 @@ How does the change to overriding a field effect the users of the existing field
 
 Currently, the time fields in the Probe struct only use values in seconds. Since this KEP proposes allowing a change of the units on those fields, that could be considered an override. 
 
-However, this change would be done on a probe by probe basis and would be opt-in. Meaning that the default behavior would not change unless the probe specifically added the offset fields to their spec. Absent that specific opt-in by using the new fields, existing users should not be impacted.
+However, this change would be done on a probe by probe basis and would be opt-in. Meaning that the default behavior would not change unless a user specifically added the millisecond fields to their spec. Absent that specific opt-in by using the new fields, existing users should not be impacted.
 
 ## Design Details
 
 Potentially proposed changes as implemented code:
-https://github.com/kubernetes/kubernetes/compare/master...psschwei:readsecondsas-probe?expand=1
+https://github.com/kubernetes/kubernetes/pull/107958/commits
+
+A quick highlighting of key points:
+
+* Implementing a feature gate (`SubSecondProbes`) to gate the feature
+
+* Adding three additional, optional fields to the Probe struct type:
+
+```
+PeriodMilliseconds *int32
+InitialDelayMilliseconds *int32
+TimeoutMilliseconds *int32
+```
+
+* Adding a utility function to get a single duration from second / millisecond values
+
+```
+// GetProbeTimeDuration combines second and millisecond time increments into a single time.Duration
+func GetProbeTimeDuration(seconds int32, milliseconds *int32) time.Duration {
+	if milliseconds != nil {
+		return time.Duration(seconds)*time.Second + time.Duration(*milliseconds)*time.Millisecond
+	}
+	return time.Duration(seconds) * time.Second
+```
+
+This would be substituted for use in the various places where times are used in `pkg/kubelet/prober`, for example:
+
+```
+-	timeout := time.Duration(p.TimeoutSeconds) * time.Second                      // existing code, to be replaced
++	timeout := GetProbeTimeDuration(p.TimeoutSeconds, p.TimeoutMilliseconds)      // new usage, replaces line above
+```
+
 
 <!--
 This section should contain enough information that the specifics of your
@@ -378,27 +410,32 @@ Must be non-negative, Zero or greater.
 
 #### Fields to Add
 What fields may be necessary to add?
+
+In pkg/apis/core/types.go
+
 ```
 
-var Offset struct {
-    value uint32
-    unit string
+type Probe struct {
+    ...
+    ...
+    // How often (in milliseconds) to perform the probe.
+	// +optional
+	PeriodMilliseconds *int32
+	// Length of time (in milliseconds) before health checking is activated.
+	// +optional
+	InitialDelayMilliseconds *int32
+	// Length of time (in milliseconds) before health checking times out.
+	// +optional
+	TimeoutMilliseconds *int32
 }
 
-PeriodSecondsOffset *Offset
-TimeoutSecondsOffset *Offset
-InitialDelaySecondsOffset *Offset
 ```
 #### Logic for Added Fields
 What is the least logic that could be used?
 
-The value of an offset must be less than one second. As an example for offset `A` (in pseudo-code): 
-
-`A.value * A.unit  < 1 * time.Second`
-
-Also `A.unit` must be able to convert to a valid subsecond value, i.e. `time.Millisecond`, `time.Microsecond`, or `time.Nanosecond`.
-
-`A = nil` will have no impact on probe values. For example, if `periodSeconds: 1` and `periodSecondsOffset: nil`, there would be no change to `periodSeconds`. 
+The combined value of `periodSeconds` and `periodMilliseconds` must be greater than 100ms.
+The combined value of `timeoutSeconds` and `timeoutMilliseconds` must be greater than 100ms.
+The combined value of `intialDelaySeconds` and `initialDelayMilliseconds` must be greater than 0ms.
 
 
 ### Existing use of Probe struct fields.
@@ -495,9 +532,9 @@ when drafting this test plan.
 
 Existing unit tests of prober `k8s.io/kubernetes/pkg/kubelet/prober/prober_manager_test.go`.
 
-Existing node-e2e test
-`/home/mhb/go/src/k8s.io/kubernetes/test/e2e/common/container_probe.go`
-Enhanced with additional test cases.
+Existing node-e2e test `k8s.io/kubernetes/test/e2e/common/container_probe.go`
+
+Enhanced with additional test cases, see the buckets added in [the draft implementation](https://github.com/kubernetes/kubernetes/pull/107958/commits)
 
 ### Graduation Criteria
 
@@ -617,7 +654,7 @@ _This section must be completed when targeting alpha to a release._
 
 * **How can this feature be enabled / disabled in a live cluster?**
   - [ X ] Feature gate (also fill in values in `kep.yaml`)
-    - Feature gate name: ProbeReadSecondsAs
+    - Feature gate name: SubSecondProbes
     - Components depending on the feature gate:
   - [ ] Other
     - Describe the mechanism:
@@ -629,20 +666,28 @@ _This section must be completed when targeting alpha to a release._
 * **Does enabling the feature change any default behavior?**
   Any change of default behavior may be surprising to users or break existing
   automations, so be extremely careful here.
+  
+  No
 
 * **Can the feature be disabled once it has been enabled (i.e. can we roll back
   the enablement)?**
   Also set `disable-supported` to `true` or `false` in `kep.yaml`.
   Describe the consequences on existing workloads (e.g., if this is a runtime
   feature, can it break the existing applications?).
+  
+  Yes, see the [drop test](https://github.com/psschwei/kubernetes/blob/1ca40771e26b96d6121c49b19c2cbe6466694c7a/pkg/api/pod/util_test.go#L1029)
 
 * **What happens if we reenable the feature if it was previously rolled back?**
+
+  No breaking changes
 
 * **Are there any tests for feature enablement/disablement?**
   The e2e framework does not currently support enabling or disabling feature
   gates. However, unit tests in each component dealing with managing data, created
   with and without the feature, are necessary. At the very least, think about
   conversion tests if API types are being modified.
+  
+  Yes, see the [drop test](https://github.com/psschwei/kubernetes/blob/1ca40771e26b96d6121c49b19c2cbe6466694c7a/pkg/api/pod/util_test.go#L1029)
 
 ### Rollout, Upgrade and Rollback Planning
 
@@ -758,14 +803,14 @@ the existing API objects?**
   - Estimated increase in size: (e.g., new annotation of size 32B)
   - Estimated amount of new objects: (e.g., new Object X for every existing Pod)
 
-No    
+No
 
 * **Will enabling / using this feature result in increasing time taken by any
 operations covered by [existing SLIs/SLOs]?**
   Think about adding additional work or introducing new steps in between
   (e.g. need to do X to start a container), etc. Please describe the details.
   
-No  
+No
 
 * **Will enabling / using this feature result in non-negligible increase of
 resource usage (CPU, RAM, disk, IO, ...) in any components?**
@@ -775,7 +820,7 @@ resource usage (CPU, RAM, disk, IO, ...) in any components?**
   This through this both in small and large cases, again with respect to the
   [supported limits].
   
-Reducing the probe frequency to subsecond intervals will result in probes polling much more frequently. In a worst case scenario, if all probes are set to the minimum value (100ms), it would result in 10x as many probe runs compared to the current state.  
+Reducing the probe frequency to subsecond intervals will result in probes polling much more frequently. In a worst case scenario, if all probes are set to the minimum value (100ms), it would result in 10x as many probe runs compared to the current state.
 
 ### Troubleshooting
 
@@ -833,21 +878,73 @@ not need to be as detailed as the proposal, but should include enough
 information to express the idea and why it was not acceptable.
 -->
 
-### Using signed integers for the offset
+### `early*Offset`
 
-Allow for the offset to be specified as either +/-, i.e. `1.5s` could be done as either `1s + 500ms` or `2s - 500ms`
+(copying directly from [Tim's comment](https://github.com/kubernetes/enhancements/pull/3067#issuecomment-1039311016))
 
-Pros:
-Allows for more granular control of legacy behavior (no rounding)
+Add an extra field to specify “early failure”: an integer quantity of milliseconds (or microseconds - we should leave room for that). That early failure offset is something that legacy clients can ignore without a big problem and would fully support round-tripping to a future Pod v2 API that unifies these fields.
 
-Cons:
-Potentially ambiguous round-tripping in a future v2 API
-### Combine old and new fields
+Using a negative offset makes the distinction between (1s - 995ms) more obvious to a legacy client that's unaware of the new fields. A positive offset (0s + 5ms, or maybe 0s + 5000μs) could get interpreted quite differently.
 
-Allow for 0 second Probe, with setting millisecond. Similar to what is done with `tv_sec` and `tv_nsec` from POSIX time structs.
+If we do that, we should absolutely disallow a negative offset ≥ 1.0s seconds. Otherwise we have a challenge around unambiguous round-tripping (eg from a future Pod v2 API back to Pod v1).
 
-Cons:
-Loosens validation.
+### `*Duration`
+
+This would be very similar to the previous option, except that it would only require one field instead of multiple ones for each unit type. For example,
+
+```yaml
+  periodDuration: 1.5s
+```
+
+This could be used in one of two ways:
+
+It could be added to the existing `*Seconds` value, as done in the previous example (i.e. `periodSeconds + periodDuration`). The same caveats listed in the previous option would also apply in this case (signed vs. unsigned, adding vs. subtracting). In this case, the value would be restricted to less than one second.
+
+Alternatively, it could _replace_ the existing `*Seconds` value, using the normalizing pattern described [here](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api_changes.md#making-a-singular-field-plural).
+
+As Tim noted, the current API guidelines [require using integers](https://github.com/kubernetes/community/blob/489de956d7b601fd23c8f48a87b501e0de4a9c7f/contributors/devel/sig-architecture/api-conventions.md?plain=1#L878-L880) for durations. That said, the preceding line also mentions that the best approach is [still TBD](https://github.com/kubernetes/community/blob/489de956d7b601fd23c8f48a87b501e0de4a9c7f/contributors/devel/sig-architecture/api-conventions.md?plain=1#L873-L876), so there's some ambiguity in the docs on this topic.
+
+### A new struct, `ProbeOffset`
+
+This one kind of splits the difference between the two previous options, using a `struct` to allow for specifying a time unit and value:
+
+```golang
+type ProbeOffset struct {
+  value uint32
+  unit string
+}
+```
+
+which would be used as follows
+
+```yaml
+  periodOffset:
+    value: 500
+    unit: milliseconds
+```
+
+This requires introducing a new type for duration, which in hindsight does not meet [either of the API conventions](https://github.com/kubernetes/community/blob/489de956d7b601fd23c8f48a87b501e0de4a9c7f/contributors/devel/sig-architecture/api-conventions.md#units) mentioned above. 
+
+Usage would be similar to the `*Duration` option, i.e. either replace or add to existing field (and if adding to the existing would be restricted to less than 1 second).
+
+### Setting the time units in a different field, `ReadSecondsAs`
+
+The last option would be specify a specific time unit value that would override, in a sense, the "seconds" in all the `*Seconds` fields. For example
+
+```yaml
+  periodSeconds: 100
+  readSecondsAs: milliseconds
+```
+
+would result in an effective period of `500ms`.
+
+Note that this would apply for all `*Seconds` values: if `readSecondsAs` is used, all probe times would need to be rendered in milliseconds. If field level granuality was required (i.e. one value in seconds, one in milliseconds), may as well create `*Milliseconds` fields.
+
+For more examples of how this would work, see [this WIP PR](https://github.com/kubernetes/kubernetes/pull/107958).
+
+Round-tripping issues are handled in a [drop function](https://github.com/kubernetes/kubernetes/blob/39a3c5c880d79fead1ae4dc80f462cac4a33878f/pkg/api/pod/util.go#L607-L636) (using similar logic as would be needed in the first two options).
+
+While this would reduce the number of new fields one has to add, it is to some degree counterintuitive to have a `*Seconds` field in milliseconds.
 
 ### v2 api for probe.
 
@@ -856,21 +953,12 @@ This seems too invasive.
 
 All Seconds fields become resource.Quantity instead of int32. This supports subdivision in a single field.
 
-### Change time unit of probe time values
-
-Example: 
-    Existing Field: PeriodSeconds int32
-    New Field: ReadSecondsAs *string
-    
-    If I want to set to 500ms / 0.5s:
-    PeriodSeconds = 500
-    ReadSecondsAs = "milliseconds"
-    
 Pros:
 minimal changes to API (only adding one field)
 
 Cons:
-requires conversion back to seconds on legacy versions (does 1.5s round up or down?)        
+requires conversion back to seconds on legacy versions (does 1.5s round up or down?)
+
 ### OffsetMilliseconds
 
 Use a negative offset, and combine with the existing field.
